@@ -18,7 +18,8 @@ package com.twitter.summingbird.online
 
 import com.twitter.util.{ Await, Future }
 import scala.collection.mutable.{ Queue => MutableQueue }
-
+import scala.collection.mutable.ListBuffer
+import scala.util.Try
 /**
  * Maintains a rolling window of futures. Future # n is
  * forced after Future (n + maxLength) is added to the
@@ -33,17 +34,32 @@ import scala.collection.mutable.{ Queue => MutableQueue }
  * @author Ashu Singhal
  */
 
-case class FutureQueue[T](init: Future[T], maxLength: Int) {
+case class FutureQueue[T](maxLength: Int) {
   require(maxLength >= 1, "maxLength cannot be negative.")
-  private val queue = MutableQueue[Future[T]](init)
+  private val queue = MutableQueue[Future[T]]()
 
-  def +=(future: Future[T]): this.type = {
+  def length = queue.length
+
+  def forceTrim: List[Try[T]] =
+    (0 until  (queue.length - maxLength)).map(_ => Try(Await.result(queue.dequeue))).toList
+
+  def popReady: List[Try[T]] = {
+    val listBuilder = new ListBuffer[Try[T]]()
+    while(queue.size > 1 && queue.head.isDefined) {
+      listBuilder += Try(Await.result(queue.dequeue))
+    }
+    listBuilder.toList
+  }
+
+  def pop: List[Try[T]] =
+    popReady ++ forceTrim
+
+
+  def <<(future: Future[T]) {
     queue += future
-    // Force extra futures.
-    while (queue.length > maxLength) { Await.result(queue.dequeue) }
+  }
 
-    // Drop all realized futures but the head off the tail
-    while(queue.size > 1 && queue.head.isDefined) { queue.dequeue }
-    this
+  def <<(futureSeq: Seq[Future[T]]) {
+    queue ++= futureSeq
   }
 }

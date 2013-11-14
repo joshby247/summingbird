@@ -25,8 +25,9 @@ import com.twitter.summingbird.batch.{BatchID, Timestamp}
 import com.twitter.summingbird.storm.option._
 import com.twitter.summingbird.option.CacheSize
 import com.twitter.summingbird.online.FutureQueue
+import scala.collection.JavaConverters._
 
-import com.twitter.util.{Await, Future}
+import com.twitter.util.{Await, Future, Promise}
 import java.util.{ Map => JMap }
 
 /**
@@ -50,6 +51,11 @@ import java.util.{ Map => JMap }
   * @author Sam Ritchie
   * @author Ashu Singhal
   */
+import org.slf4j.LoggerFactory
+
+object SummerBolt {
+  @transient private val logger = LoggerFactory.getLogger(classOf[SummerBolt[_, _]])
+}
 
 class SummerBolt[Key, Value: Monoid](
   @transient storeSupplier: () => MergeableStore[(Key,BatchID), Value],
@@ -61,15 +67,18 @@ class SummerBolt[Key, Value: Monoid](
   includeSuccessHandler: IncludeSuccessHandler,
   anchor: AnchorTuples,
   shouldEmit: Boolean) extends BaseBolt(metrics.metrics) {
+  import SummerBolt._
   import Constants._
 
   val storeBox = Externalizer(storeSupplier)
-  lazy val store = storeBox.get.apply
+  lazy val storePromise = Promise[MergeableStore[(Key,BatchID), Value]]()
+  lazy val store = storePromise.get
+  case class MergeData(oldTuples: List[Tuple], ts: Timestamp, key: Key, delta: Value, prevValue: Option[Value])
 
   // See MaxWaitingFutures for a todo around removing this.
   lazy val cacheCount = cacheSize.size
-  lazy val buffer = SummingQueue[Map[(Key, BatchID), (Timestamp, Value)]](cacheCount.getOrElse(0))
-  lazy val futureQueue = FutureQueue(Future.Unit, maxWaitingFutures.get)
+  lazy val buffer = SummingQueue[Map[(Key, BatchID), (List[Tuple], Timestamp, Value)]](cacheCount.getOrElse(0))
+  lazy val futureQueue = FutureQueue[MergeData](maxWaitingFutures.get)
 
   val exceptionHandlerBox = Externalizer(exceptionHandler)
   val successHandlerBox = Externalizer(successHandler)
@@ -80,6 +89,9 @@ class SummerBolt[Key, Value: Monoid](
 
   override def prepare(
     conf: JMap[_,_], context: TopologyContext, oc: OutputCollector) {
+    storePromise.setValue(storeBox.get.apply)
+    logger.warn("Store object realized: " + store.toString)
+
     super.prepare(conf, context, oc)
     // see IncludeSuccessHandler for why this is needed
     successHandlerOpt = if (includeSuccessHandler.get)
@@ -95,35 +107,43 @@ class SummerBolt[Key, Value: Monoid](
     val id = tuple.getValue(0).asInstanceOf[BatchID]
     val key = tuple.getValue(1).asInstanceOf[Key]
     val (ts, value) = tuple.getValue(2).asInstanceOf[(Timestamp, Value)]
-    ((key, id), (ts, value))
+    ((key, id), (List(tuple), ts, value))
   }
 
   def toValues(time: Timestamp, item: Any): Values = new Values((time.milliSinceEpoch, item))
 
+  def emit(mergeData: MergeData) {
+     if(shouldEmit) {
+      val values = toValues(mergeData.ts, (mergeData.key, (mergeData.prevValue, mergeData.delta)))
+        onCollector { col =>
+            if (anchor.anchor) {
+              col.emit(mergeData.oldTuples.asJava, values)
+            }
+            else {
+              col.emit(values)
+            }
+        }
+      }
+  }
+
+  private def processFinished {
+      val mergeResults = futureQueue.pop
+      mergeResults.foreach { mTry =>
+        val mergeRes: MergeData = mTry.get
+        emit(mergeRes)
+      }
+  }
+
   override def execute(tuple: Tuple) {
+    logger.info("Queue size: " + futureQueue.length)
+    processFinished
+
     // See MaxWaitingFutures for a todo around simplifying this.
     buffer(Map(unpack(tuple))).foreach { pairs =>
-      val futures = pairs.map { case ((k, batchID), (ts, delta)) =>
+      futureQueue << pairs.map { case ((k, batchID), (oldTuples, ts, delta)) =>
         val pair = ((k, batchID), delta)
-
-        val mergeFuture = store.merge(pair)
-          .handle(exceptionHandlerBox.get.handlerFn)
-
-        for (handler <- successHandlerOpt)
-          mergeFuture.onSuccess { _ => handler.handlerFn() }
-
-        if(shouldEmit) {
-          mergeFuture.map { res =>
-            onCollector { col =>
-              val values = toValues(ts, (k, (res, delta)))
-                if (anchor.anchor)
-                  col.emit(tuple, values)
-                else col.emit(values)
-            }
-          }
-        } else mergeFuture
+        store.merge(pair).map(res => MergeData(oldTuples, ts, k, delta, res))
       }.toList
-      futureQueue += Future.collect(futures).unit
     }
     onCollector { _.ack(tuple) }
   }
