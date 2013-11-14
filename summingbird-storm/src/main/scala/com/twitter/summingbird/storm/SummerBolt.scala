@@ -26,9 +26,11 @@ import com.twitter.summingbird.storm.option._
 import com.twitter.summingbird.option.CacheSize
 import com.twitter.summingbird.online.FutureQueue
 import scala.collection.JavaConverters._
+import org.slf4j.LoggerFactory
 
 import com.twitter.util.{Await, Future, Promise}
 import java.util.{ Map => JMap }
+import scala.util.Try
 
 /**
   * The SummerBolt takes two related options: CacheSize and MaxWaitingFutures.
@@ -51,7 +53,6 @@ import java.util.{ Map => JMap }
   * @author Sam Ritchie
   * @author Ashu Singhal
   */
-import org.slf4j.LoggerFactory
 
 object SummerBolt {
   @transient private val logger = LoggerFactory.getLogger(classOf[SummerBolt[_, _]])
@@ -110,9 +111,11 @@ class SummerBolt[Key, Value: Monoid](
     ((key, id), (List(tuple), ts, value))
   }
 
+  def toValues(time: Timestamp, item: Any): Values = new Values((time.milliSinceEpoch, item))
+
   def emit(mergeData: MergeData) {
     if(shouldEmit) {
-      val values = new Values(mergeData.ts.milliSinceEpoch, (mergeData.key, (mergeData.prevValue, mergeData.delta)))
+      val values = toValues(mergeData.ts, (mergeData.key, (mergeData.prevValue, mergeData.delta)))
       onCollector { col =>
         if (anchor.anchor) {
           col.emit(mergeData.oldTuples.asJava, values)
@@ -125,14 +128,22 @@ class SummerBolt[Key, Value: Monoid](
   }
 
   override def execute(tuple: Tuple) {
-    futureQueue.pop.foreach(emit(_.get))
+    futureQueue.pop.foreach{t: Try[MergeData] => emit(t.get)}
 
     // See MaxWaitingFutures for a todo around simplifying this.
     buffer(Map(unpack(tuple))).foreach { pairs =>
-      futureQueue << pairs.foreach { case ((k, batchID), (oldTuples, ts, delta)) =>
-        val pair = ((k, batchID), delta)
-        store.merge(pair).map(res => MergeData(oldTuples, ts, k, delta, res))
-      }.toList
+      val (lookupMap, mergeMap) = pairs.foldLeft((Map[(Key, BatchID), (List[Tuple], Timestamp, Value)](), Map[(Key, BatchID), Value]())) { case ((lookupMap, mergeMap), ((k, batchID), (oldTuples, ts, delta))) =>
+        val key = (k, batchID)
+        val cacheVal = (oldTuples, ts, delta)
+        val storeVal = delta
+        ((lookupMap + (key -> cacheVal)), (mergeMap + (key -> storeVal)))
+      }
+      futureQueue << store.multiMerge(mergeMap).toList.map {case (k, fOpt) =>
+        fOpt.map{ prevOpt =>
+          val (oldTuples, ts, delta) = lookupMap(k)
+          MergeData(oldTuples, ts, k._1, delta, prevOpt)
+        }
+      }
     }
     onCollector { _.ack(tuple) }
   }
