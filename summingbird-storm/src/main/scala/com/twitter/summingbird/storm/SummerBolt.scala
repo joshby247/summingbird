@@ -110,37 +110,26 @@ class SummerBolt[Key, Value: Monoid](
     ((key, id), (List(tuple), ts, value))
   }
 
-  def toValues(time: Timestamp, item: Any): Values = new Values((time.milliSinceEpoch, item))
-
   def emit(mergeData: MergeData) {
-     if(shouldEmit) {
-      val values = toValues(mergeData.ts, (mergeData.key, (mergeData.prevValue, mergeData.delta)))
-        onCollector { col =>
-            if (anchor.anchor) {
-              col.emit(mergeData.oldTuples.asJava, values)
-            }
-            else {
-              col.emit(values)
-            }
+    if(shouldEmit) {
+      val values = new Values(mergeData.ts.milliSinceEpoch, (mergeData.key, (mergeData.prevValue, mergeData.delta)))
+      onCollector { col =>
+        if (anchor.anchor) {
+          col.emit(mergeData.oldTuples.asJava, values)
+        }
+        else {
+          col.emit(values)
         }
       }
-  }
-
-  private def processFinished {
-      val mergeResults = futureQueue.pop
-      mergeResults.foreach { mTry =>
-        val mergeRes: MergeData = mTry.get
-        emit(mergeRes)
-      }
+    }
   }
 
   override def execute(tuple: Tuple) {
-    logger.info("Queue size: " + futureQueue.length)
-    processFinished
+    futureQueue.pop.foreach(emit(_.get))
 
     // See MaxWaitingFutures for a todo around simplifying this.
     buffer(Map(unpack(tuple))).foreach { pairs =>
-      futureQueue << pairs.map { case ((k, batchID), (oldTuples, ts, delta)) =>
+      futureQueue << pairs.foreach { case ((k, batchID), (oldTuples, ts, delta)) =>
         val pair = ((k, batchID), delta)
         store.merge(pair).map(res => MergeData(oldTuples, ts, k, delta, res))
       }.toList
